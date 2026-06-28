@@ -170,33 +170,32 @@ def label_proposals(
 # =========================================================================== #
 
 class FastRCNN(nn.Module):
-    """
-    Fast R-CNN — ResNet-50 backbone, RoI Pool head.
-
-    Freeze strategy
-    ---------------
-    Frozen   : stem (conv1+bn1) + layer1  → universal low-level features
-    Trainable: layer2, layer3, layer4, head
-    BN in frozen stages stays in eval mode throughout (freeze_bn()).
-    """
-
     def __init__(
         self,
-        num_classes:       int   = 2,           # 0=bg, 1=pneumonia
-        roi_pool_size:     int   = 7,
-        roi_spatial_scale: float = 1.0 / 16.0,  # ResNet-50 stride at layer4
+        num_classes=2,
+        roi_pool_size=7,
+        roi_spatial_scale=1/32,      # ResNet layer4 stride
+        hidden_dim=1024,
     ):
         super().__init__()
+
         self.num_classes = num_classes
 
         bb = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
-        self.stem   = nn.Sequential(bb.conv1, bb.bn1, bb.relu, bb.maxpool)
+
+        self.stem = nn.Sequential(
+            bb.conv1,
+            bb.bn1,
+            bb.relu,
+            bb.maxpool,
+        )
+
         self.layer1 = bb.layer1
         self.layer2 = bb.layer2
         self.layer3 = bb.layer3
         self.layer4 = bb.layer4
 
-        # Freeze stem + layer1
+        # Freeze low-level features
         for m in [self.stem, self.layer1]:
             for p in m.parameters():
                 p.requires_grad = False
@@ -206,67 +205,74 @@ class FastRCNN(nn.Module):
             spatial_scale=roi_spatial_scale,
         )
 
-        in_feat = 2048 * roi_pool_size * roi_pool_size
+        # Reduce each pooled ROI to 2048 features
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
         self.head = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(in_feat, 4096), nn.ReLU(inplace=True), nn.Dropout(0.5),
-            nn.Linear(4096,    4096), nn.ReLU(inplace=True), nn.Dropout(0.5),
+            nn.Linear(2048, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
         )
-        self.cls_score = nn.Linear(4096, num_classes)
-        self.bbox_pred = nn.Linear(4096, num_classes * 4)
+
+        self.cls_score = nn.Linear(hidden_dim, num_classes)
+        self.bbox_pred = nn.Linear(hidden_dim, num_classes * 4)
 
         nn.init.normal_(self.cls_score.weight, std=0.01)
         nn.init.constant_(self.cls_score.bias, 0)
+
         nn.init.normal_(self.bbox_pred.weight, std=0.001)
         nn.init.constant_(self.bbox_pred.bias, 0)
 
     def freeze_bn(self):
         for m in [self.stem, self.layer1]:
             for mod in m.modules():
-                if isinstance(mod, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                if isinstance(mod, nn.BatchNorm2d):
                     mod.eval()
 
-    def train(self, mode: bool = True):
+    def train(self, mode=True):
         super().train(mode)
         if mode:
             self.freeze_bn()
         return self
 
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+    def extract_features(self, x):
         x = self.stem(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-        return x                               # (B, 2048, H/32, W/32)
+        return x
 
-    def forward(
-        self,
-        images:    torch.Tensor,               # (B, 3, H, W)
-        proposals: list[torch.Tensor],         # list of (P_i, 4)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        fmap = self.extract_features(images)   # (B, 2048, h, w)
+    def forward(self, images, proposals):
+
+        fmap = self.extract_features(images)
 
         roi_list = []
         for i, props in enumerate(proposals):
-            idx_col = torch.full((len(props), 1), i,
-                                 dtype=props.dtype, device=props.device)
-            roi_list.append(torch.cat([idx_col, props], dim=1))
-        rois = torch.cat(roi_list, dim=0)      # (total_P, 5)
+            idx = torch.full(
+                (len(props), 1),
+                i,
+                dtype=props.dtype,
+                device=props.device,
+            )
+            roi_list.append(torch.cat([idx, props], dim=1))
 
-        pooled = self.roi_pool(fmap, rois)     # (total_P, 2048, 7, 7)
-        print("\n========== Forward Debug ==========")
-        print("Feature map shape :", fmap.shape)
-        print("RoIs shape        :", rois.shape)
-        print("Pooled shape      :", pooled.shape)
-        print("Flattened shape   :", pooled.flatten(1).shape)
-        print("Num proposals     :", pooled.shape[0])
-        print("===================================\n")
-        feat   = self.head(pooled)             # (total_P, 4096)
+        rois = torch.cat(roi_list, dim=0)
 
-        return self.cls_score(feat), self.bbox_pred(feat)
+        pooled = self.roi_pool(fmap, rois)      # (N,2048,7,7)
+        pooled = self.avgpool(pooled)           # (N,2048,1,1)
 
+        feat = self.head(pooled)
 
+        cls_logits = self.cls_score(feat)
+        bbox_deltas = self.bbox_pred(feat)
+
+        return cls_logits, bbox_deltas
 # =========================================================================== #
 #  Loss
 # =========================================================================== #
@@ -480,35 +486,8 @@ def run_one_epoch(
 
             cat_lbls = torch.cat(sampled_lbls)
             cat_tgts = torch.cat(sampled_tgts)
-            print("\n========== Batch Debug ==========")
-            print("Images:", images.shape)
 
-            for i, p in enumerate(sampled_props):
-                print(f"Image {i}: {len(p)} sampled proposals")
-
-            print("Total proposals:", sum(len(p) for p in sampled_props))
-
-            if torch.cuda.is_available():
-                for gpu in range(torch.cuda.device_count()):
-                    print(
-                        f"GPU {gpu}: "
-                        f"allocated={torch.cuda.memory_allocated(gpu)/1024**2:.1f} MB, "
-                        f"reserved={torch.cuda.memory_reserved(gpu)/1024**2:.1f} MB"
-                    )
-
-            print("=================================\n")
-            try:
-                cls_logits, bbox_deltas = model(images, sampled_props)
-            except RuntimeError as e:
-                print("\nForward pass failed!\n")
-                print(e)
-
-                if torch.cuda.is_available():
-                    for gpu in range(torch.cuda.device_count()):
-                        print(f"\n===== GPU {gpu} =====")
-                        print(torch.cuda.memory_summary(device=gpu))
-
-                raise
+            cls_logits, bbox_deltas = model(images, sampled_props)
             loss, cls_l, loc_l = fast_rcnn_loss(
                 cls_logits, bbox_deltas, cat_lbls, cat_tgts
             )
@@ -568,13 +547,7 @@ def main():
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_gpus    = torch.cuda.device_count()
     print(f"[*] Device : {device}  |  GPUs visible: {n_gpus}")
-    if device.type == "cuda":
-        for i in range(n_gpus):
-            props = torch.cuda.get_device_properties(i)
-            print(f"\nGPU {i}: {props.name}")
-            print(f"  Total memory : {props.total_memory / 1024**3:.2f} GB")
-            print(f"  Allocated    : {torch.cuda.memory_allocated(i) / 1024**2:.2f} MB")
-            print(f"  Reserved     : {torch.cuda.memory_reserved(i) / 1024**2:.2f} MB")
+
     # ---- Data ---------------------------------------------------------------
     train_ids, val_ids = make_splits(args.csv_path, args.val_frac, args.seed)
     print(f"[*] Train: {len(train_ids)}  Val: {len(val_ids)}")
