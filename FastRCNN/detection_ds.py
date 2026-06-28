@@ -71,10 +71,13 @@ class DetectionDataset(Dataset):
 
     def _load_image(self, path: str) -> torch.Tensor:
         img = Image.open(path)
-        # 16-bit grayscale needs to be scaled down to 8-bit before RGB conversion
         if img.mode in ("I;16", "I"):
-            img = img.point(lambda x: x / 256).convert("L")
-            img = img.convert("RGB")
+            arr = np.array(img, dtype=np.float32)
+            if arr.max() > 0:
+                arr = arr / arr.max()
+            arr = (arr * 255).astype(np.uint8)
+            img = Image.fromarray(arr, mode="L")
+        img = img.convert("RGB")
         return TF.to_tensor(img)
 
     def __getitem__(self, idx: int):
