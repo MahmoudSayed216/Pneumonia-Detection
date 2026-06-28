@@ -178,6 +178,7 @@ def main(args):
     val_ds = DetectionDataset(
         csv_path=args.csv,
         img_dir=args.img_dir,
+
         split="val",
         train_frac=args.train_frac,
     )
