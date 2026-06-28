@@ -40,26 +40,28 @@ def get_pneumonia_dicts(csv_path: str, img_dir: str, patient_ids: list) -> list:
     return dataset
 
 
-def register_pneumonia(csv_path: str, img_dir: str, train_frac: float = 0.8):
+def register_pneumonia(csv_path: str, img_dir: str, train_frac: float = 0.8, data_frac: float = 1.0):
     all_pids = sorted(pd.read_csv(csv_path)["patientId"].unique().tolist())
-    cutoff   = int(len(all_pids) * train_frac)
-
+    
+    # Subsample before splitting
+    subset_cutoff = int(len(all_pids) * data_frac)
+    all_pids = all_pids[:subset_cutoff]
+    
+    cutoff    = int(len(all_pids) * train_frac)
     train_ids = all_pids[:cutoff]
     val_ids   = all_pids[cutoff:]
 
     for split, pids in [("train", train_ids), ("val", val_ids)]:
         name = f"pneumonia_{split}"
-
-        # Guard against re-registration if imported multiple times
         if name in DatasetCatalog.list():
             DatasetCatalog.remove(name)
             MetadataCatalog.remove(name)
-
         DatasetCatalog.register(
             name,
             lambda p=pids: get_pneumonia_dicts(csv_path, img_dir, p)
         )
         MetadataCatalog.get(name).set(thing_classes=["pneumonia"])
 
+    print(f"Using {subset_cutoff}/{len(all_pids)} patients ({data_frac*100:.0f}%)")
     print(f"Registered: {len(train_ids)} train / {len(val_ids)} val patients")
     return train_ids, val_ids
