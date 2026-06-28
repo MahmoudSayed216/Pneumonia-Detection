@@ -129,9 +129,9 @@ def evaluate(model, loader, device):
     """
     model.eval()
 
-    metric_50     = MeanAveragePrecision(iou_thresholds=[0.50], iou_type="bbox")
+    metric_50     = MeanAveragePrecision(iou_thresholds=[0.50], iou_type="bbox", sync_on_compute=False)
     custom_thresholds = list(np.arange(0.40, 0.76, 0.05).round(2))
-    metric_custom = MeanAveragePrecision(iou_thresholds=custom_thresholds, iou_type="bbox")
+    metric_custom = MeanAveragePrecision(iou_thresholds=custom_thresholds, iou_type="bbox", sync_on_compute=False)
 
     for images, targets in loader:
         images  = [img.to(device) for img in images]
