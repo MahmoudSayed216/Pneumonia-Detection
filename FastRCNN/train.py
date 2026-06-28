@@ -255,6 +255,13 @@ class FastRCNN(nn.Module):
         rois = torch.cat(roi_list, dim=0)      # (total_P, 5)
 
         pooled = self.roi_pool(fmap, rois)     # (total_P, 2048, 7, 7)
+        print("\n========== Forward Debug ==========")
+        print("Feature map shape :", fmap.shape)
+        print("RoIs shape        :", rois.shape)
+        print("Pooled shape      :", pooled.shape)
+        print("Flattened shape   :", pooled.flatten(1).shape)
+        print("Num proposals     :", pooled.shape[0])
+        print("===================================\n")
         feat   = self.head(pooled)             # (total_P, 4096)
 
         return self.cls_score(feat), self.bbox_pred(feat)
@@ -473,8 +480,35 @@ def run_one_epoch(
 
             cat_lbls = torch.cat(sampled_lbls)
             cat_tgts = torch.cat(sampled_tgts)
+            print("\n========== Batch Debug ==========")
+            print("Images:", images.shape)
 
-            cls_logits, bbox_deltas = model(images, sampled_props)
+            for i, p in enumerate(sampled_props):
+                print(f"Image {i}: {len(p)} sampled proposals")
+
+            print("Total proposals:", sum(len(p) for p in sampled_props))
+
+            if torch.cuda.is_available():
+                for gpu in range(torch.cuda.device_count()):
+                    print(
+                        f"GPU {gpu}: "
+                        f"allocated={torch.cuda.memory_allocated(gpu)/1024**2:.1f} MB, "
+                        f"reserved={torch.cuda.memory_reserved(gpu)/1024**2:.1f} MB"
+                    )
+
+            print("=================================\n")
+            try:
+                cls_logits, bbox_deltas = model(images, sampled_props)
+            except RuntimeError as e:
+                print("\nForward pass failed!\n")
+                print(e)
+
+                if torch.cuda.is_available():
+                    for gpu in range(torch.cuda.device_count()):
+                        print(f"\n===== GPU {gpu} =====")
+                        print(torch.cuda.memory_summary(device=gpu))
+
+                raise
             loss, cls_l, loc_l = fast_rcnn_loss(
                 cls_logits, bbox_deltas, cat_lbls, cat_tgts
             )
@@ -534,7 +568,13 @@ def main():
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_gpus    = torch.cuda.device_count()
     print(f"[*] Device : {device}  |  GPUs visible: {n_gpus}")
-
+    if device.type == "cuda":
+        for i in range(n_gpus):
+            props = torch.cuda.get_device_properties(i)
+            print(f"\nGPU {i}: {props.name}")
+            print(f"  Total memory : {props.total_memory / 1024**3:.2f} GB")
+            print(f"  Allocated    : {torch.cuda.memory_allocated(i) / 1024**2:.2f} MB")
+            print(f"  Reserved     : {torch.cuda.memory_reserved(i) / 1024**2:.2f} MB")
     # ---- Data ---------------------------------------------------------------
     train_ids, val_ids = make_splits(args.csv_path, args.val_frac, args.seed)
     print(f"[*] Train: {len(train_ids)}  Val: {len(val_ids)}")
