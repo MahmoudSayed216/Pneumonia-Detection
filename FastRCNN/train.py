@@ -403,7 +403,7 @@ def evaluate_map(
                                         box_format="xyxy").to(device)
 
     # unwrap DataParallel to call extract_features / forward on a single module
-    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    raw_model =  model
     raw_model.eval()
 
     proposal_offset = 0  # running offset into the concatenated RoI output
@@ -577,9 +577,9 @@ def main():
 
     if n_gpus > 1:
         print(f"[*] Wrapping model in DataParallel across {n_gpus} GPUs")
-        model = nn.DataParallel(model)
+        # model = nn.DataParallel(model)
 
-    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    raw_model =  model
     total     = sum(p.numel() for p in raw_model.parameters())
     frozen    = sum(p.numel() for p in raw_model.parameters() if not p.requires_grad)
     print(f"[*] Parameters — total: {total:,}  frozen: {frozen:,}  "
