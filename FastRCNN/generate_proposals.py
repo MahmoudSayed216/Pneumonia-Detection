@@ -20,7 +20,6 @@ from tqdm import tqdm
 
 
 def compute_proposals(args_tuple):
-    """Run selective search on one image, save proposals as .npy"""
     img_path, out_dir, max_proposals = args_tuple
     img_path = Path(img_path)
     out_path = Path(out_dir) / f"{img_path.stem}.npy"
@@ -29,16 +28,21 @@ def compute_proposals(args_tuple):
         return (img_path.stem, None)
 
     try:
-        img = cv2.imread(str(img_path))
-        if img is None:
+        # IMREAD_UNCHANGED reads 16-bit correctly, then convert to 8-bit for selective search
+        img_16 = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+        if img_16 is None:
             return (img_path.stem, "cv2 failed to read image")
 
+        # Normalize to 8-bit BGR for selective search
+        img_8 = (img_16 / 256).astype(np.uint8)
+        if len(img_8.shape) == 2:          # grayscale → BGR
+            img_8 = cv2.cvtColor(img_8, cv2.COLOR_GRAY2BGR)
+
         ss = cv2.ximgproc.segmentation.createSelectiveSearchSegmentation()
-        ss.setBaseImage(img)
+        ss.setBaseImage(img_8)
         ss.switchToSelectiveSearchFast()
 
-        rects = ss.process()[:max_proposals]   # (x, y, w, h)
-        # convert to (x1, y1, x2, y2)
+        rects = ss.process()[:max_proposals]
         boxes = np.array(
             [[x, y, x + w, y + h] for x, y, w, h in rects],
             dtype=np.float32,

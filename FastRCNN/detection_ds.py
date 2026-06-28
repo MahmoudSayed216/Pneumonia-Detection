@@ -74,7 +74,7 @@ class DetectionDataset(Dataset):
         # 16-bit grayscale needs to be scaled down to 8-bit before RGB conversion
         if img.mode in ("I;16", "I"):
             img = img.point(lambda x: x / 256).convert("L")
-        img = img.convert("RGB")
+            img = img.convert("RGB")
         return TF.to_tensor(img)
 
     def __getitem__(self, idx: int):
