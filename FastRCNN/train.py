@@ -47,7 +47,7 @@ from torchvision.ops import RoIPool, nms, box_convert
 from torchmetrics.detection import MeanAveragePrecision
 from tqdm import tqdm
 
-from dataset import (
+from detection_ds import (
     PneumoniaDetectionDataset,
     fast_rcnn_collate,
     make_splits,
