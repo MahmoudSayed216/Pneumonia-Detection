@@ -4,6 +4,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
+from PIL import Image
 
 
 class DetectionDataset(Dataset):
@@ -69,9 +70,11 @@ class DetectionDataset(Dataset):
         return len(self.patient_ids)
 
     def _load_image(self, path: str) -> torch.Tensor:
-        """Return a float32 tensor [3, H, W] in [0, 1]."""
-        from PIL import Image
-        img = Image.open(path).convert("RGB")
+        img = Image.open(path)
+        # 16-bit grayscale needs to be scaled down to 8-bit before RGB conversion
+        if img.mode in ("I;16", "I"):
+            img = img.point(lambda x: x / 256).convert("L")
+        img = img.convert("RGB")
         return TF.to_tensor(img)
 
     def __getitem__(self, idx: int):
