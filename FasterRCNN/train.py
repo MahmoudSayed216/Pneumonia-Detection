@@ -37,7 +37,7 @@ from torchvision.models.detection import (
 )
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
-from dataset import DetectionDataset, collate_fn
+from detection_ds import DetectionDataset, collate_fn
 
 
 # ---------------------------------------------------------------------------
