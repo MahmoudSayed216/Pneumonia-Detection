@@ -87,7 +87,7 @@ class DetectionDataset(Dataset):
         # Sort unique patient IDs for a deterministic, reproducible split.
         # Sorting on UUID-style IDs distributes patients uniformly since
         # UUIDs have no temporal or alphabetical ordering bias.
-        all_pids = sorted(df["patient_id"].unique().tolist())
+        all_pids = sorted(df["patientId"].unique().tolist())
         cutoff   = int(len(all_pids) * train_frac)
 
         if split == "train":
@@ -101,7 +101,7 @@ class DetectionDataset(Dataset):
 
         # Build annotation lookup only for patients in this split
         self.annotations = {
-            pid: df[df["patient_id"] == pid].reset_index(drop=True)
+            pid: df[df["patientId"] == pid].reset_index(drop=True)
             for pid in self.patient_ids
         }
 
