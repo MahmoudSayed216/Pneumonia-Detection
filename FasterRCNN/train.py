@@ -28,7 +28,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from torchvision.models.detection import (
@@ -166,24 +166,27 @@ def main(args):
     if is_main(rank):
         print(f"DDP: {dist.get_world_size()} GPUs  |  device: {device}")
 
-    # --- Dataset & splits (identical split on every rank via fixed seed) ---
-    full_dataset = DetectionDataset(
+    # --- Dataset & splits ---
+    # Split is done inside DetectionDataset on sorted unique patient IDs so
+    # the same patient is never in both train and val (no leakage).
+    train_ds = DetectionDataset(
         csv_path=args.csv,
         img_dir=args.img_dir,
         img_ext=args.img_ext,
+        split="train",
+        train_frac=args.train_frac,
     )
-
-    n_total = len(full_dataset)
-    n_val   = max(1, int(n_total * args.val_split))
-    n_train = n_total - n_val
-    train_ds, val_ds = random_split(
-        full_dataset,
-        [n_train, n_val],
-        generator=torch.Generator().manual_seed(42),
+    val_ds = DetectionDataset(
+        csv_path=args.csv,
+        img_dir=args.img_dir,
+        img_ext=args.img_ext,
+        split="val",
+        train_frac=args.train_frac,
     )
 
     if is_main(rank):
-        print(f"Dataset: {n_total} images  →  train={n_train}, val={n_val}")
+        print(f"Dataset split (train_frac={args.train_frac}): "
+              f"train={len(train_ds)} patients, val={len(val_ds)} patients")
 
     # DistributedSampler shards the training set across GPUs so each GPU sees
     # a unique, non-overlapping subset of samples every epoch.
@@ -291,7 +294,8 @@ if __name__ == "__main__":
     parser.add_argument("--csv",         required=True,  help="Path to annotations CSV")
     parser.add_argument("--img_dir",     required=True,  help="Directory containing images")
     parser.add_argument("--img_ext",     default=".png", help="Image file extension")
-    parser.add_argument("--val_split",   type=float, default=0.2)
+    parser.add_argument("--train_frac",  type=float, default=0.8,
+                        help="Fraction of patients used for training (rest go to val)")
     parser.add_argument("--num_workers", type=int,   default=4,
                         help="DataLoader workers per GPU")
 
