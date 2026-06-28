@@ -223,9 +223,10 @@ def main(args):
 
     # --- Optimizer & scheduler ---
     params = [p for p in ddp_model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(
-        params, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay
-    )
+    # optimizer = torch.optim.SGD(
+    #     params, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay
+    # )
+    optimizer = torch.optim.AdamW(params, lr=args.lr)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma
     )
