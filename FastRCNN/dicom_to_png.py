@@ -1,147 +1,107 @@
 """
-convert_dcm_to_png.py — Convert only the DICOM files referenced in a CSV to 16-bit PNGs.
-
-Why 16-bit?
-    Standard 8-bit PNG maps the full pixel range to 256 levels, which loses
-    fine-grained intensity detail that matters in medical imaging. 16-bit PNG
-    preserves 65 536 levels, retaining the full dynamic range of the X-ray
-    after normalisation.
+Script 1 — DICOM → PNG converter
+---------------------------------
+Converts a directory of .dcm files to PNG images, normalising
+the pixel array to uint8 so standard vision libraries can read them.
 
 Usage:
-    python convert_dcm_to_png.py \
-        --csv     resampled_data.csv \
-        --dcm_dir /path/to/dicoms \
-        --out_dir /path/to/pngs
+    python 01_convert_dicom.py \
+        --dicom_dir  /data/dicom \
+        --output_dir /data/images \
+        [--workers 8]
 
-    # Parallelise across 8 CPU cores:
-    python convert_dcm_to_png.py \
-        --csv     resampled_data.csv \
-        --dcm_dir /path/to/dicoms \
-        --out_dir /path/to/pngs \
-        --workers 8
+Output layout (mirrors the input tree):
+    /data/images/<patientId>.png
 """
 
 import argparse
+import os
 from pathlib import Path
-from multiprocessing import Pool, cpu_count
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
-import pandas as pd
 import pydicom
-import pydicom.pixel_data_handlers.util as pdu
 from PIL import Image
 from tqdm import tqdm
 
 
-# ---------------------------------------------------------------------------
-# Single-file conversion
-# ---------------------------------------------------------------------------
-
-def convert_one(args_tuple):
+# --------------------------------------------------------------------------- #
+def convert_one(dcm_path: Path, output_dir: Path) -> str:
     """
-    Convert a single DICOM file to a 16-bit PNG.
-    Packed into a tuple for multiprocessing.Pool compatibility.
-    Returns (patient_id, error_message_or_None).
+    Convert a single DICOM file to a normalised 8-bit PNG.
+    Returns the output path as a string (or raises on failure).
     """
-    dcm_path, out_dir = args_tuple
-    dcm_path = Path(dcm_path)
-    out_path = Path(out_dir) / dcm_path.with_suffix(".png").name
-
-    # Skip if already converted — safe to re-run on interrupted jobs
-    if out_path.exists():
-        return (dcm_path.stem, None)
-
     try:
-        ds  = pydicom.dcmread(str(dcm_path))
-        arr = pdu.apply_modality_lut(ds.pixel_array, ds).astype(np.float32)
+        ds = pydicom.dcmread(str(dcm_path))
+        pixel_array = ds.pixel_array.astype(np.float32)
 
-        # Per-image min-max normalisation to [0, 1]
-        lo, hi = arr.min(), arr.max()
-        if hi > lo:
-            arr = (arr - lo) / (hi - lo)
+        # Handle multi-frame DICOMs — take the middle frame
+        if pixel_array.ndim == 3:
+            pixel_array = pixel_array[pixel_array.shape[0] // 2]
+
+        # Apply DICOM window / VOI LUT if present, then normalise to [0, 255]
+        if hasattr(ds, "WindowCenter") and hasattr(ds, "WindowWidth"):
+            center = float(ds.WindowCenter) if not isinstance(ds.WindowCenter, pydicom.multival.MultiValue) \
+                else float(ds.WindowCenter[0])
+            width = float(ds.WindowWidth) if not isinstance(ds.WindowWidth, pydicom.multival.MultiValue) \
+                else float(ds.WindowWidth[0])
+            lo = center - width / 2.0
+            hi = center + width / 2.0
+            pixel_array = np.clip(pixel_array, lo, hi)
+            pixel_array = (pixel_array - lo) / (hi - lo) * 255.0
         else:
-            arr = np.zeros_like(arr)
+            pmin, pmax = pixel_array.min(), pixel_array.max()
+            if pmax > pmin:
+                pixel_array = (pixel_array - pmin) / (pmax - pmin) * 255.0
+            else:
+                pixel_array = np.zeros_like(pixel_array)
 
-        arr_16 = (arr * 65535).astype(np.uint16)
-        Image.fromarray(arr_16, mode="I;16").save(out_path)
+        img = Image.fromarray(pixel_array.astype(np.uint8))
 
-        return (dcm_path.stem, None)
+        # Preserve relative path so the output tree mirrors the input tree
+        rel = dcm_path.stem          # patientId (filename without extension)
+        out_path = output_dir / f"{rel}.png"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(str(out_path))
+        return str(out_path)
 
-    except Exception as e:
-        return (dcm_path.stem, str(e))
+    except Exception as exc:
+        return f"ERROR {dcm_path}: {exc}"
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+def main():
+    parser = argparse.ArgumentParser(description="Convert DICOM files to PNG")
+    parser.add_argument("--dicom_dir",  required=True, help="Root directory containing .dcm files")
+    parser.add_argument("--output_dir", required=True, help="Where to save PNG files")
+    parser.add_argument("--workers",    type=int, default=4, help="Parallel workers (default 4)")
+    args = parser.parse_args()
 
-def main(args):
-    dcm_dir = Path(args.dcm_dir)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    dicom_dir  = Path(args.dicom_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Read CSV and get the patient IDs we actually need ---
-    df          = pd.read_csv(args.csv)
-    patient_ids = set(df["patientId"].unique())
-    print(f"CSV contains {len(patient_ids)} unique patient IDs to convert.")
-
-    # --- Match IDs to DICOM files in dcm_dir ---
-    dcm_files = [
-        dcm_dir / f"{pid}.dcm"
-        for pid in patient_ids
-    ]
-
-    # Warn about any IDs whose file is missing
-    missing = [p for p in dcm_files if not p.exists()]
-    if missing:
-        print(f"WARNING: {len(missing)} DICOM file(s) not found in {dcm_dir}:")
-        for p in missing[:10]:   # cap output at 10 lines
-            print(f"  {p.name}")
-        if len(missing) > 10:
-            print(f"  ... and {len(missing) - 10} more")
-
-    dcm_files = [p for p in dcm_files if p.exists()]
+    dcm_files = sorted(dicom_dir.rglob("*.dcm"))
     if not dcm_files:
-        print("No matching DICOM files found. Aborting.")
+        print(f"[!] No .dcm files found under {dicom_dir}")
         return
 
-    print(f"Converting {len(dcm_files)} files → {out_dir}")
-
-    n_workers = args.workers or cpu_count()
-    tasks     = [(str(p), str(out_dir)) for p in dcm_files]
+    print(f"[*] Found {len(dcm_files)} DICOM files — converting with {args.workers} workers …")
 
     errors = []
-    with Pool(processes=n_workers) as pool:
-        for pid, err in tqdm(
-            pool.imap_unordered(convert_one, tasks),
-            total=len(tasks),
-            desc="Converting",
-            unit="file",
-        ):
-            if err:
-                errors.append((pid, err))
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(convert_one, p, output_dir): p for p in dcm_files}
+        for fut in tqdm(as_completed(futures), total=len(futures), unit="file"):
+            result = fut.result()
+            if result.startswith("ERROR"):
+                errors.append(result)
 
-    print(f"\nDone. {len(tasks) - len(errors)}/{len(tasks)} files converted successfully.")
+    print(f"[✓] Done. {len(dcm_files) - len(errors)}/{len(dcm_files)} converted successfully.")
     if errors:
-        print(f"\n{len(errors)} file(s) failed:")
-        for pid, err in errors:
-            print(f"  {pid}: {err}")
+        print(f"[!] {len(errors)} errors:")
+        for e in errors:
+            print(f"    {e}")
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Convert CSV-referenced DICOM X-rays to 16-bit PNG"
-    )
-    parser.add_argument("--csv",     "--csv",                  required=True,
-                        help="CSV file with a 'patientId' column (e.g. resampled_data.csv)")
-    parser.add_argument("--dcm_dir", "--dcm-dir", dest="dcm_dir", required=True,
-                        help="Directory containing the source .dcm files")
-    parser.add_argument("--out_dir", "--out-dir", dest="out_dir", required=True,
-                        help="Directory to write the output .png files")
-    parser.add_argument("--workers", type=int, default=None,
-                        help="Parallel worker count (default: all CPU cores)")
-    main(parser.parse_args())
+    main()

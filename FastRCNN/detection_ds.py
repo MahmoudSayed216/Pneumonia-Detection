@@ -1,128 +1,274 @@
-import os
+"""
+Script 3 — Fast R-CNN Dataset
+-------------------------------
+PyTorch Dataset that ties together:
+  • The PNG images converted from DICOM (Script 1)
+  • The ground-truth CSV  (patientId, x, y, width, height, Target)
+  • The pre-computed Selective Search proposals (Script 2, HDF5)
+
+For each sample the Dataset returns a dict that the Fast R-CNN model
+(Script 4) expects:
+  {
+    "image"       : FloatTensor  (3, H, W)   — normalised image
+    "proposals"   : FloatTensor  (P, 4)      — [x1, y1, x2, y2] Selective Search boxes
+    "boxes"       : FloatTensor  (G, 4)      — ground-truth boxes  [x1, y1, x2, y2]
+    "labels"      : LongTensor   (G,)        — 1 for pneumonia, 0 background
+    "patient_id"  : str
+  }
+
+Usage (standalone sanity-check):
+    python 03_dataset.py \
+        --csv_path   /data/labels.csv \
+        --image_dir  /data/images \
+        --proposals  /data/proposals.h5
+
+The collate_fn at the bottom of this file handles variable-length proposals
+and ground-truth boxes for DataLoader batching.
+"""
+
+import argparse
+from pathlib import Path
+from typing import Optional
+
+import h5py
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
-import torchvision.transforms.functional as TF
 from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms as T
 
 
-class DetectionDataset(Dataset):
+# --------------------------------------------------------------------------- #
+#  Augmentation / normalisation pipelines
+# --------------------------------------------------------------------------- #
+
+# ImageNet stats are used even for greyscale X-rays because the pretrained
+# ResNet backbone expects 3-channel input with these statistics.
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+
+def build_transforms(train: bool = True, image_size: int = 800) -> T.Compose:
     """
-    Dataset for Faster R-CNN pneumonia detection from chest X-rays.
+    Returns a torchvision transform pipeline.
+    Images are resized so the shorter side == image_size, then we apply
+    random horizontal flip (train-only) and ImageNet normalisation.
+    """
+    ops = [T.Resize(image_size)]
+    if train:
+        ops += [T.RandomHorizontalFlip(p=0.5)]
+    ops += [
+        T.ToTensor(),
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ]
+    return T.Compose(ops)
 
-    CSV schema: patient_id, x, y, width, height, Target
-        - patient_id    : filename stem (without extension) matching the image file
-        - x, y          : top-left corner of the bounding box (pixels)
-        - width, height : box dimensions (pixels)
-        - Target        : integer class label (1 = pneumonia).
-                          NaN in any box column means the image is healthy
-                          (no pneumonia) — the model still sees it, but with
-                          an empty box list so it learns to suppress proposals.
 
-    Args:
-        csv_path   : path to the annotations CSV
-        img_dir    : directory that contains the images
-        split      : "train", "val", or "all"
-        train_frac : fraction of patients used for training (e.g. 0.8 -> 80% train,
-                     20% val). The split is performed on the SORTED list of unique
-                     patient IDs so the same patient never appears in both sets,
-                     preventing label leakage from repeated IDs.
-        transforms : optional callable applied to (image, Target) pairs
+# --------------------------------------------------------------------------- #
+#  Dataset
+# --------------------------------------------------------------------------- #
+
+class PneumoniaDetectionDataset(Dataset):
+    """
+    Pneumonia detection dataset for Fast R-CNN training.
+
+    Parameters
+    ----------
+    csv_path      : path to the ground-truth CSV
+    image_dir     : directory containing PNG images named <patientId>.png
+    proposals_h5  : HDF5 file produced by Script 2
+    split         : list of patient IDs in this split (train / val)
+    train         : whether to apply training-time augmentation
+    image_size    : shorter side to resize to
+    max_proposals : maximum Selective Search proposals to keep per image
     """
 
     def __init__(
         self,
         csv_path: str,
-        img_dir: str,
-        split: str = "train",
-        train_frac: float = 0.8,
-        transforms=None,
+        image_dir: str,
+        proposals_h5: str,
+        split: Optional[list] = None,
+        train: bool = True,
+        image_size: int = 800,
+        max_proposals: int = 2000,
     ):
-        assert split in ("train", "val", "all"), \
-            f"split must be 'train', 'val', or 'all', got '{split}'"
-        assert 0.0 < train_frac < 1.0, \
-            f"train_frac must be in (0, 1), got {train_frac}"
+        self.image_dir     = Path(image_dir)
+        self.train         = train
+        self.max_proposals = max_proposals
+        self.transform     = build_transforms(train, image_size)
 
-        self.img_dir    = img_dir
-        self.transforms = transforms
-
+        # ---- load CSV -------------------------------------------------------
         df = pd.read_csv(csv_path)
 
-        all_pids = sorted(df["patientId"].unique().tolist())
-        cutoff   = int(len(all_pids) * train_frac)
+        # Rows with Target == 0 have no bounding box → only keep the patientId
+        # Group so each patient appears once
+        pos = df[df["Target"] == 1].copy()
+        neg_ids = df[df["Target"] == 0]["patientId"].unique().tolist()
 
-        if split == "train":
-            selected = all_pids[:cutoff]
-        elif split == "val":
-            selected = all_pids[cutoff:]
-        else:
-            selected = all_pids
+        # Build a mapping  patientId → list of [x1,y1,x2,y2] boxes
+        self.gt: dict[str, np.ndarray] = {}
 
-        self.patient_ids = selected
+        for pid, grp in pos.groupby("patientId"):
+            boxes = grp[["x", "y", "width", "height"]].values.astype(np.float32)
+            # convert [x, y, w, h] → [x1, y1, x2, y2]
+            boxes[:, 2] = boxes[:, 0] + boxes[:, 2]
+            boxes[:, 3] = boxes[:, 1] + boxes[:, 3]
+            self.gt[pid] = boxes
 
-        self.annotations = {
-            pid: df[df["patientId"] == pid].reset_index(drop=True)
-            for pid in self.patient_ids
-        }
+        for pid in neg_ids:
+            if pid not in self.gt:
+                self.gt[pid] = np.zeros((0, 4), dtype=np.float32)
+
+        # Patient list
+        all_ids = list(self.gt.keys())
+        if split is not None:
+            all_ids = [p for p in all_ids if p in set(split)]
+        self.patient_ids = sorted(all_ids)
+
+        # ---- open the proposals HDF5 in lazy mode ---------------------------
+        self._h5_path = proposals_h5
+        self._h5: Optional[h5py.File] = None  # opened lazily per worker
+
+    # ------------------------------------------------------------------ #
+    def _open_h5(self):
+        if self._h5 is None:
+            self._h5 = h5py.File(self._h5_path, "r")
 
     def __len__(self) -> int:
         return len(self.patient_ids)
 
-    def _load_image(self, path: str) -> torch.Tensor:
-        img = Image.open(path)
-        if img.mode in ("I;16", "I"):
-            arr = np.array(img, dtype=np.float32)
-            if arr.max() > 0:
-                arr = arr / arr.max()
-            arr = (arr * 255).astype(np.uint8)
-            img = Image.fromarray(arr, mode="L")
-        img = img.convert("RGB")
-        return TF.to_tensor(img)
+    def __getitem__(self, idx: int) -> dict:
+        pid = self.patient_ids[idx]
 
-    def __getitem__(self, idx: int):
-        patient_id = self.patient_ids[idx]
-        img_path   = os.path.join(self.img_dir, f"{patient_id}.png")
+        # ---- image ----------------------------------------------------------
+        img_path = self.image_dir / f"{pid}.png"
+        img = Image.open(img_path).convert("RGB")   # greyscale DICOM → RGB
+        img_tensor = self.transform(img)             # (3, H, W) float32
 
-        image = self._load_image(img_path)
+        # ---- ground-truth boxes & labels ------------------------------------
+        gt_boxes = self.gt[pid].copy()              # (G, 4)  x1y1x2y2
+        gt_labels = np.ones(len(gt_boxes), dtype=np.int64) if len(gt_boxes) > 0 \
+                    else np.zeros(0, dtype=np.int64)
 
-        ann   = self.annotations[patient_id]
-        valid = ann.dropna(subset=["x", "y", "width", "height"])
-
-        if len(valid) == 0:
-            boxes  = torch.zeros((0, 4), dtype=torch.float32)
-            labels = torch.zeros((0,),   dtype=torch.int64)
-            area   = torch.zeros((0,),   dtype=torch.float32)
+        # ---- proposals from HDF5 --------------------------------------------
+        self._open_h5()
+        if pid in self._h5["proposals"]:
+            proposals = self._h5["proposals"][pid][:].astype(np.float32)
         else:
-            boxes = torch.tensor(
-                [
-                    [row.x, row.y, row.x + row.width, row.y + row.height]
-                    for row in valid.itertuples()
-                ],
-                dtype=torch.float32,
-            )
-            labels = torch.tensor(valid["Target"].values, dtype=torch.int64)
-            area   = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
+            # Fall back: use GT boxes as proposals (degenerate case)
+            proposals = gt_boxes.copy() if len(gt_boxes) > 0 \
+                        else np.zeros((1, 4), dtype=np.float32)
 
-        iscrowd = torch.zeros(len(labels), dtype=torch.int64)
+        # Limit number of proposals
+        if len(proposals) > self.max_proposals:
+            proposals = proposals[:self.max_proposals]
 
-        Target = {
-            "boxes":    boxes,
-            "labels":   labels,
-            "image_id": torch.tensor([idx]),
-            "area":     area,
-            "iscrowd":  iscrowd,
+        return {
+            "image":      img_tensor,
+            "proposals":  torch.from_numpy(proposals),
+            "boxes":      torch.from_numpy(gt_boxes),
+            "labels":     torch.from_numpy(gt_labels),
+            "patient_id": pid,
         }
 
-        if self.transforms is not None:
-            image, Target = self.transforms(image, Target)
+    def __del__(self):
+        if self._h5 is not None:
+            try:
+                self._h5.close()
+            except Exception:
+                pass
 
-        return image, Target
 
+# --------------------------------------------------------------------------- #
+#  Collate function
+# --------------------------------------------------------------------------- #
 
-def collate_fn(batch):
+def fast_rcnn_collate(batch: list) -> dict:
     """
-    Faster R-CNN expects a list of (image, Target) tuples, NOT a stacked
-    tensor, because images can differ in size and box count.
+    Stacks images into a single tensor; keeps proposals / boxes / labels
+    as lists because they differ in length across the batch.
     """
-    return tuple(zip(*batch))
+    images      = torch.stack([b["image"]     for b in batch], dim=0)
+    proposals   = [b["proposals"]  for b in batch]
+    boxes       = [b["boxes"]      for b in batch]
+    labels      = [b["labels"]     for b in batch]
+    patient_ids = [b["patient_id"] for b in batch]
+
+    return {
+        "images":      images,
+        "proposals":   proposals,
+        "boxes":       boxes,
+        "labels":      labels,
+        "patient_ids": patient_ids,
+    }
+
+
+# --------------------------------------------------------------------------- #
+#  Utility: train / val split
+# --------------------------------------------------------------------------- #
+
+def make_splits(
+    csv_path: str,
+    val_fraction: float = 0.15,
+    seed: int = 42,
+) -> tuple[list, list]:
+    """
+    Returns (train_ids, val_ids) — stratified by Target to keep class balance.
+    """
+    df = pd.read_csv(csv_path)
+    all_ids = df["patientId"].unique().tolist()
+
+    pos_ids = df[df["Target"] == 1]["patientId"].unique().tolist()
+    neg_ids = [p for p in all_ids if p not in set(pos_ids)]
+
+    rng = np.random.default_rng(seed)
+
+    def split_list(lst):
+        n_val = max(1, int(len(lst) * val_fraction))
+        idx   = rng.permutation(len(lst))
+        return [lst[i] for i in idx[n_val:]], [lst[i] for i in idx[:n_val]]
+
+    pos_train, pos_val = split_list(pos_ids)
+    neg_train, neg_val = split_list(neg_ids)
+
+    return pos_train + neg_train, pos_val + neg_val
+
+
+# --------------------------------------------------------------------------- #
+#  Sanity check
+# --------------------------------------------------------------------------- #
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--csv_path",  required=True)
+    parser.add_argument("--image_dir", required=True)
+    parser.add_argument("--proposals", required=True)
+    args = parser.parse_args()
+
+    train_ids, val_ids = make_splits(args.csv_path)
+    print(f"[*] Train: {len(train_ids)}  Val: {len(val_ids)}")
+
+    ds = PneumoniaDetectionDataset(
+        csv_path=args.csv_path,
+        image_dir=args.image_dir,
+        proposals_h5=args.proposals,
+        split=train_ids,
+        train=True,
+    )
+    print(f"[*] Dataset length: {len(ds)}")
+
+    sample = ds[0]
+    print(f"[*] Sample patient_id : {sample['patient_id']}")
+    print(f"    image shape        : {sample['image'].shape}")
+    print(f"    proposals shape    : {sample['proposals'].shape}")
+    print(f"    GT boxes shape     : {sample['boxes'].shape}")
+    print(f"    GT labels          : {sample['labels']}")
+
+    loader = DataLoader(
+        ds, batch_size=2, shuffle=False, collate_fn=fast_rcnn_collate, num_workers=0
+    )
+    batch = next(iter(loader))
+    print(f"[*] Batch images shape : {batch['images'].shape}")
+    print("[✓] Dataset OK")
