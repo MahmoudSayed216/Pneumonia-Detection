@@ -10,11 +10,11 @@ class DetectionDataset(Dataset):
     """
     Dataset for Faster R-CNN pneumonia detection from chest X-rays.
 
-    CSV schema: patient_id, x, y, width, height, target
+    CSV schema: patient_id, x, y, width, height, Target
         - patient_id    : filename stem (without extension) matching the image file
         - x, y          : top-left corner of the bounding box (pixels)
         - width, height : box dimensions (pixels)
-        - target        : integer class label (1 = pneumonia).
+        - Target        : integer class label (1 = pneumonia).
                           NaN in any box column means the image is healthy
                           (no pneumonia) — the model still sees it, but with
                           an empty box list so it learns to suppress proposals.
@@ -27,7 +27,7 @@ class DetectionDataset(Dataset):
                      20% val). The split is performed on the SORTED list of unique
                      patient IDs so the same patient never appears in both sets,
                      preventing label leakage from repeated IDs.
-        transforms : optional callable applied to (image, target) pairs
+        transforms : optional callable applied to (image, Target) pairs
     """
 
     def __init__(
@@ -95,12 +95,12 @@ class DetectionDataset(Dataset):
                 ],
                 dtype=torch.float32,
             )
-            labels = torch.tensor(valid["target"].values, dtype=torch.int64)
+            labels = torch.tensor(valid["Target"].values, dtype=torch.int64)
             area   = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
 
         iscrowd = torch.zeros(len(labels), dtype=torch.int64)
 
-        target = {
+        Target = {
             "boxes":    boxes,
             "labels":   labels,
             "image_id": torch.tensor([idx]),
@@ -109,14 +109,14 @@ class DetectionDataset(Dataset):
         }
 
         if self.transforms is not None:
-            image, target = self.transforms(image, target)
+            image, Target = self.transforms(image, Target)
 
-        return image, target
+        return image, Target
 
 
 def collate_fn(batch):
     """
-    Faster R-CNN expects a list of (image, target) tuples, NOT a stacked
+    Faster R-CNN expects a list of (image, Target) tuples, NOT a stacked
     tensor, because images can differ in size and box count.
     """
     return tuple(zip(*batch))
